@@ -1,6 +1,43 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px;vertical-align:top}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}.block{background:#fdeeee;border-left:5px solid #c0392b;padding:10px 14px;margin:10px 0}.ok{color:#1d7a4f;font-weight:600}.pending{color:#b9770e;font-weight:600}.dead{color:#999}code{background:#edf0f2;padding:2px 5px}.hash{font-size:12px;color:#6b7780}</style>
+<h1>公共采购密封投标与评审</h1><div class="card">开标后由监督员确认评分基准快照；评分项、权重、分值调整只形成待生效修订，复核通过才产生新版本基准，同一项目始终只有一个生效基准。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<div id="bar" style="margin:10px 0">身份：
+<select id="role"><option value="public">public</option><option value="procurement">procurement</option><option value="evaluator">evaluator</option><option value="supervisor" selected>supervisor</option><option value="auditor">auditor</option><option value="vendor">vendor</option></select>
+用户：<input id="user" value="sup1" style="width:120px"> <button onclick="load()">刷新</button></div>
+<h2>采购项目（点击查看基准与修订）</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>生效基准</th><th>版本</th></tr></thead><tbody></tbody></table>
+<h2>项目详情：评分基准 / 修订记录 / 阻断原因</h2><div id="detail" class="card">点击上表项目编号加载。</div>
+<script>
+const $=s=>document.querySelector(s);
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function api(path,opts){const r=await fetch(path,Object.assign({headers:{'X-User':$('#user').value||'pub','X-Role':$('#role').value}},opts||{}));return r.json()}
+async function load(){
+  const d=await api('/api/state');
+  $('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td><a href="#" onclick="show(${r.id});return false">${r.tender_no}</a></td><td>${esc(r.title)}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>—</td><td>${r.version}</td></tr>`).join('');
+}
+async function show(id){
+  const d=await api('/api/tenders/'+id);
+  if(d.error){$('#detail').innerHTML='<span class="block">'+esc(d.error)+'</span>';return}
+  const ab=d.active_baseline;
+  let html=`<h3>${esc(d.tender.tender_no)} ${esc(d.tender.title)} · ${d.tender.status} · 第${d.tender.evaluation_round}轮</h3>`;
+  html+=`<p>生效基准：${ab?`<b>v${ab.version}</b> <span class="hash">${ab.criteria_hash.slice(0,16)}…</span> 确认人 ${esc(ab.confirmed_by)} @ ${ab.confirmed_at}`:'<span class="pending">无（监督员确认后方可评分/授标）</span>'}</p>`;
+  if(ab) html+=`<table><thead><tr><th>评分项</th><th>类型</th><th>权重</th><th>上限/基准</th></tr></thead><tbody>${ab.criteria.map(c=>`<tr><td>${esc(c.name)}</td><td>${c.kind}</td><td>${c.weight}</td><td>${c.max_value}</td></tr>`).join('')}</tbody></table>`;
+  if(d.blockers!==undefined){
+    if(d.blockers.length) html+='<div class="block"><b>授标阻断原因：</b><ul>'+d.blockers.map(b=>`<li><code>${b.code}</code> ${esc(b.reason)}</li>`).join('')+'</ul></div>';
+    else html+='<p class="ok">无阻断原因，可授标。</p>';
+  }
+  if(d.revisions!==undefined && d.revisions.length){
+    html+=`<h4>修订记录</h4><table><thead><tr><th>#</th><th>基于版本</th><th>调整</th><th>状态</th><th>提出人</th><th>复核人</th><th>复核意见</th></tr></thead><tbody>`+
+      d.revisions.map(r=>`<tr><td>${r.id}</td><td>v${r.expected_version}</td><td class="hash">${r.criteria.map(c=>esc(c.name)+':'+c.weight).join('，')}</td><td class="${r.status==='pending'?'pending':r.status==='approved'?'ok':'dead'}">${r.status}</td><td>${esc(r.proposed_by)}</td><td>${esc(r.reviewed_by||'')}</td><td>${esc(r.review_note||'')}</td></tr>`).join('')+
+      `</tbody></table>`;
+  }
+  if(d.evaluation_rounds!==undefined && d.evaluation_rounds.length){
+    html+='<h4>各轮评分按当时基准回读</h4>';
+    for(const rd of d.evaluation_rounds) for(const g of rd.groups){
+      html+=`<p>第${rd.round}轮 · 基准 <b>v${g.baseline_version}</b> <span class="dead">(${g.baseline_status||'历史'})</span> <span class="hash">${(g.criteria_hash||'').slice(0,12)}…</span> 确认人 ${esc(g.confirmed_by||'')}</p>`;
+      html+='<table><thead><tr><th>投标</th><th>供应商</th><th>评审人</th><th>分项得分</th></tr></thead><tbody>'+
+        g.bids.map(b=>b.evaluators.map(e=>`<tr><td>${b.bid_id}</td><td>${b.vendor_id}</td><td>${esc(e.evaluator)}</td><td class="hash">${Object.entries(e.scores).map(([k,v])=>esc(k)+'='+v).join('，')}</td></tr>`).join('')).join('')+'</tbody></table>';
+    }
+  }
+  $('#detail').innerHTML=html;
+}
+load();</script></html>
