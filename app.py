@@ -162,9 +162,56 @@ class ProcurementService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scoring_baselines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    baseline_no INTEGER NOT NULL,
+                    applies_round INTEGER NOT NULL,
+                    criteria TEXT NOT NULL,
+                    criteria_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    confirmed_by TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    superseded_at TEXT,
+                    UNIQUE(tender_id,baseline_no)
+                );
+                CREATE TABLE IF NOT EXISTS baseline_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    baseline_id INTEGER NOT NULL REFERENCES scoring_baselines(id),
+                    applied_baseline_id INTEGER REFERENCES scoring_baselines(id),
+                    revision_no INTEGER NOT NULL,
+                    criteria TEXT NOT NULL,
+                    criteria_hash TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    expected_version INTEGER NOT NULL,
+                    proposed_by TEXT NOT NULL,
+                    proposed_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_note TEXT NOT NULL DEFAULT '',
+                    block_reason TEXT NOT NULL DEFAULT '',
+                    UNIQUE(tender_id,revision_no)
+                );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_baselines_tender ON scoring_baselines(tender_id,status);
+                CREATE INDEX IF NOT EXISTS idx_revisions_tender ON baseline_revisions(tender_id,status);
                 """
+            )
+            # 旧库补齐：评分必须记录所依据的基准快照
+            eval_cols = {row["name"] for row in conn.execute("PRAGMA table_info(evaluations)")}
+            if "baseline_id" not in eval_cols:
+                conn.execute("ALTER TABLE evaluations ADD COLUMN baseline_id INTEGER REFERENCES scoring_baselines(id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_eval_baseline ON evaluations(bid_id,evaluation_round,baseline_id)"
+            )
+            # 同一项目同一时刻只能有一个生效基准
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_single_active "
+                "ON scoring_baselines(tender_id) WHERE status='active'"
             )
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
@@ -179,6 +226,69 @@ class ProcurementService:
         if not row:
             raise DomainError("采购项目不存在", 404)
         return row
+
+    @staticmethod
+    def normalize_criteria(criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把评分项校验并归一化为可快照的结构；权重合计必须等于100。"""
+        if not isinstance(criteria, list):
+            raise DomainError("评分项必须是数组")
+        normalized_criteria: list[dict[str, Any]] = []
+        total_weight = Decimal("0")
+        for item in criteria:
+            if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+                raise DomainError("评分项格式无效")
+            kind = item.get("kind", "direct")
+            if kind not in {"direct", "cost"}:
+                raise DomainError("评分项类型只支持 direct 或 cost")
+            try:
+                weight = Decimal(str(item["weight"]))
+                max_value = Decimal(str(item.get("max_value", 100)))
+            except (KeyError, InvalidOperation, TypeError) as exc:
+                raise DomainError("评分权重或上限无效") from exc
+            if weight <= 0 or max_value <= 0:
+                raise DomainError("评分权重和上限必须大于0")
+            normalized_criteria.append({"name": str(item["name"]).strip(), "kind": kind,
+                                        "weight": float(weight), "max_value": float(max_value)})
+            total_weight += weight
+        if not normalized_criteria or total_weight != 100:
+            raise DomainError("评分项权重合计必须等于100")
+        names = [c["name"] for c in normalized_criteria]
+        if len(set(names)) != len(names):
+            raise DomainError("评分项名称不能重复")
+        return normalized_criteria
+
+    def _active_baseline(self, conn: sqlite3.Connection, tender_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM scoring_baselines WHERE tender_id=? AND status='active'",
+            (tender_id,),
+        ).fetchone()
+
+    def _ranking(self, conn: sqlite3.Connection, tender_id: int, round_no: int,
+                 baseline: sqlite3.Row) -> list[dict[str, Any]]:
+        """按指定基准快照回读该轮评分并计算排名（旧评分按当时基准回读）。"""
+        criteria = json.loads(baseline["criteria"])
+        expected_criteria = {c["name"] for c in criteria}
+        bids = conn.execute(
+            "SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified','awarded') ORDER BY id",
+            (tender_id,),
+        ).fetchall()
+        ranking = []
+        for bid in bids:
+            rows = conn.execute(
+                """SELECT criterion,AVG(score) AS score FROM evaluations
+                   WHERE bid_id=? AND evaluation_round=? AND baseline_id=? GROUP BY criterion""",
+                (bid["id"], round_no, baseline["id"]),
+            ).fetchall()
+            scores = {row["criterion"]: row["score"] for row in rows}
+            if set(scores) != expected_criteria:
+                continue
+            weighted = 0.0
+            for criterion in criteria:
+                weighted += scores[criterion["name"]] * criterion["weight"] / 100
+            ranking.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "price": bid["price"],
+                            "score": round(weighted, 2), "baseline_id": baseline["id"]})
+        ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
+        return ranking
 
     def create_vendor(self, actor: str, role: str, vendor_no: str, name: str,
                       representative: str) -> dict[str, Any]:
@@ -204,26 +314,7 @@ class ProcurementService:
         parse_time(deadline)
         if not tender_no.strip() or not title.strip():
             raise DomainError("项目编号和标题不能为空")
-        normalized_criteria = []
-        total_weight = Decimal("0")
-        for item in criteria:
-            if not isinstance(item, dict) or not str(item.get("name", "")).strip():
-                raise DomainError("评分项格式无效")
-            kind = item.get("kind", "direct")
-            if kind not in {"direct", "cost"}:
-                raise DomainError("评分项类型只支持 direct 或 cost")
-            try:
-                weight = Decimal(str(item["weight"]))
-                max_value = Decimal(str(item.get("max_value", 100)))
-            except (KeyError, InvalidOperation) as exc:
-                raise DomainError("评分权重或上限无效") from exc
-            if weight <= 0 or max_value <= 0:
-                raise DomainError("评分权重和上限必须大于0")
-            total_weight += weight
-            normalized_criteria.append({"name": str(item["name"]).strip(), "kind": kind,
-                                        "weight": float(weight), "max_value": float(max_value)})
-        if not normalized_criteria or total_weight != 100:
-            raise DomainError("评分项权重合计必须等于100")
+        normalized_criteria = self.normalize_criteria(criteria)
         with self.connect() as conn:
             try:
                 cur = conn.execute(
@@ -384,7 +475,10 @@ class ProcurementService:
             ).fetchone()
             if conflict:
                 raise DomainError("评审人与该供应商存在利益冲突", 403)
-            criteria = json.loads(tender["criteria"])
+            baseline = self._active_baseline(conn, tender["id"])
+            if not baseline:
+                raise DomainError("评分基准尚未经监督员确认，不能评分", 409)
+            criteria = json.loads(baseline["criteria"])
             missing = [c["name"] for c in criteria if c["name"] not in values]
             if missing:
                 raise DomainError("缺少评分项: " + ",".join(missing))
@@ -409,13 +503,15 @@ class ProcurementService:
                 if existing:
                     raise DomainError("该评分项已提交，不能覆盖", 409)
                 cur = conn.execute(
-                    """INSERT INTO evaluations(bid_id,evaluation_round,evaluator,criterion,raw_value,score,comment,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (bid_id, tender["evaluation_round"], actor, criterion["name"], raw, score, comment.strip(), now, now),
+                    """INSERT INTO evaluations(bid_id,evaluation_round,evaluator,criterion,raw_value,score,comment,baseline_id,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (bid_id, tender["evaluation_round"], actor, criterion["name"], raw, score, comment.strip(), baseline["id"], now, now),
                 )
                 created.append(dict(conn.execute("SELECT * FROM evaluations WHERE id=?", (cur.lastrowid,)).fetchone()))
-            self._audit(conn, tender["id"], actor, "bid.evaluated", {"bid_id": bid_id, "criteria": [item["criterion"] for item in created]})
-            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"], "evaluations": created}
+            self._audit(conn, tender["id"], actor, "bid.evaluated",
+                        {"bid_id": bid_id, "baseline_id": baseline["id"], "criteria": [item["criterion"] for item in created]})
+            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"],
+                    "baseline_id": baseline["id"], "evaluations": created}
 
     def disqualify_bid(self, actor: str, role: str, bid_id: int, reason: str,
                        expected_version: int) -> dict[str, Any]:
@@ -514,53 +610,322 @@ class ProcurementService:
             self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
 
+    def confirm_scoring_baseline(self, actor: str, role: str, tender_id: int,
+                                 expected_version: int) -> dict[str, Any]:
+        """监督员开标后确认评分口径，冻结为可恢复的生效基准快照。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "确认评分基准")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["version"] != int(expected_version):
+                raise DomainError("项目已变化，请刷新后重试", 409)
+            if tender["status"] not in {"opened", "reevaluation"}:
+                raise DomainError("只有开标后的项目可以确认评分基准", 409)
+            if self._active_baseline(conn, tender_id):
+                raise DomainError("已存在生效基准，调整口径只能提交待生效修订", 409)
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM baseline_revisions WHERE tender_id=? AND status='pending'",
+                (tender_id,),
+            ).fetchone()["c"]
+            if pending:
+                raise DomainError("存在待生效修订，不能重复确认基准", 409)
+            criteria = self.normalize_criteria(json.loads(tender["criteria"]))
+            criteria_hash = canonical_hash(criteria)
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO scoring_baselines(tender_id,baseline_no,applies_round,criteria,criteria_hash,confirmed_by,confirmed_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (tender_id, 1, tender["evaluation_round"], json.dumps(criteria, ensure_ascii=False), criteria_hash, actor, now),
+            )
+            conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (now, tender_id))
+            baseline = dict(conn.execute("SELECT * FROM scoring_baselines WHERE id=?", (cur.lastrowid,)).fetchone())
+            baseline["criteria"] = criteria
+            self._audit(conn, tender_id, actor, "baseline.confirmed",
+                        {"baseline_id": baseline["id"], "round": baseline["applies_round"], "criteria_hash": criteria_hash})
+            return {"baseline": baseline}
+
+    def propose_baseline_revision(self, actor: str, role: str, tender_id: int,
+                                  criteria: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+        """采购员对评分项/权重/分值的调整只形成待生效修订，不改当前生效基准。"""
+        actor = clean_actor(actor)
+        require_role(role, {"procurement"}, "提出评分基准修订")
+        if not str(reason or "").strip():
+            raise DomainError("修订原因不能为空")
+        normalized_criteria = self.normalize_criteria(criteria)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"}:
+                raise DomainError("当前项目阶段不能调整评分口径", 409)
+            baseline = self._active_baseline(conn, tender_id)
+            if not baseline:
+                raise DomainError("评分基准尚未确认，不能提出修订", 409)
+            if baseline["criteria_hash"] == canonical_hash(normalized_criteria):
+                raise DomainError("修订内容与生效基准一致，无需提交", 409)
+            existing = conn.execute(
+                "SELECT COUNT(*) AS c FROM baseline_revisions WHERE tender_id=? AND status='pending'",
+                (tender_id,),
+            ).fetchone()["c"]
+            if existing:
+                raise DomainError("已有待生效修订，请等待监督员复核后再提交", 409)
+            next_no = (conn.execute(
+                "SELECT COALESCE(MAX(revision_no),0)+1 AS n FROM baseline_revisions WHERE tender_id=?",
+                (tender_id,),
+            ).fetchone()["n"])
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO baseline_revisions(tender_id,baseline_id,revision_no,criteria,criteria_hash,reason,
+                                                  expected_version,proposed_by,proposed_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (tender_id, baseline["id"], next_no, json.dumps(normalized_criteria, ensure_ascii=False),
+                 canonical_hash(normalized_criteria), reason.strip(), baseline["version"], actor, now),
+            )
+            revision = dict(conn.execute("SELECT * FROM baseline_revisions WHERE id=?", (cur.lastrowid,)).fetchone())
+            revision["criteria"] = normalized_criteria
+            self._audit(conn, tender_id, actor, "baseline.revision_proposed",
+                        {"revision_id": revision["id"], "baseline_id": baseline["id"], "reason": reason.strip()})
+            return {"revision": revision, "active_baseline": {"id": baseline["id"], "version": baseline["version"]}}
+
+    def review_baseline_revision(self, actor: str, role: str, revision_id: int, decision: str,
+                                 expected_version: int, note: str = "") -> dict[str, Any]:
+        """监督员复核修订：通过则生成新生效基准（旧基准保留），驳回/阻断保持现状。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核评分基准修订")
+        if decision not in {"approved", "rejected"}:
+            raise DomainError("复核决定只支持 approved 或 rejected")
+        if decision == "rejected" and not str(note or "").strip():
+            raise DomainError("驳回复核必须填写说明")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            revision = conn.execute("SELECT * FROM baseline_revisions WHERE id=?", (revision_id,)).fetchone()
+            if not revision:
+                raise DomainError("修订不存在", 404)
+            tender = self._tender(conn, revision["tender_id"])
+            if revision["status"] != "pending":
+                raise DomainError("修订已处理: %s（%s）" % (revision["status"], revision["block_reason"] or revision["review_note"]), 409)
+            baseline = conn.execute("SELECT * FROM scoring_baselines WHERE id=?", (revision["baseline_id"],)).fetchone()
+            if not baseline or baseline["version"] != int(expected_version):
+                conn.execute(
+                    "UPDATE baseline_revisions SET status='blocked',block_reason=?,reviewed_by=?,reviewed_at=? WHERE id=?",
+                    ("基准版本已变化，修订针对的旧版本已失效", actor, utcnow(), revision_id),
+                )
+                self._audit(conn, tender["id"], actor, "baseline.revision_blocked",
+                            {"revision_id": revision_id, "reason": "基准版本不匹配"})
+                conn.commit()  # 阻断记录必须保留，随后抛出的冲突异常不应回滚它
+                raise DomainError("版本冲突：基准已被新版本取代，修订无法生效", 409)
+            now = utcnow()
+            if decision == "rejected":
+                conn.execute(
+                    "UPDATE baseline_revisions SET status='rejected',reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                    (actor, now, note.strip(), revision_id),
+                )
+                self._audit(conn, tender["id"], actor, "baseline.revision_rejected",
+                            {"revision_id": revision_id, "note": note.strip()})
+                return {"revision": dict(conn.execute("SELECT * FROM baseline_revisions WHERE id=?", (revision_id,)).fetchone())}
+            # 通过：再校验一次口径合法性，生成新生效基准
+            criteria = self.normalize_criteria(json.loads(revision["criteria"]))
+            if baseline["criteria_hash"] == canonical_hash(criteria):
+                raise DomainError("修订内容与生效基准一致，不能批准", 409)
+            next_no = (conn.execute(
+                "SELECT COALESCE(MAX(baseline_no),0)+1 AS n FROM scoring_baselines WHERE tender_id=?",
+                (tender["id"],),
+            ).fetchone()["n"])
+            # 先让旧基准失效，保证“同一项目只有一个生效基准”的唯一索引成立
+            conn.execute(
+                "UPDATE scoring_baselines SET status='superseded',version=version+1,superseded_at=? WHERE tender_id=? AND status='active'",
+                (now, tender["id"]),
+            )
+            new_cur = conn.execute(
+                """INSERT INTO scoring_baselines(tender_id,baseline_no,applies_round,criteria,criteria_hash,confirmed_by,confirmed_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (tender["id"], next_no, tender["evaluation_round"], json.dumps(criteria, ensure_ascii=False),
+                 canonical_hash(criteria), actor, now),
+            )
+            new_baseline_id = new_cur.lastrowid
+            conn.execute(
+                "UPDATE baseline_revisions SET status='applied',applied_baseline_id=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                (new_baseline_id, actor, now, note.strip(), revision_id),
+            )
+            # 晚到的其它待生效修订遇到版本冲突，记录阻断原因
+            blocked = conn.execute(
+                """UPDATE baseline_revisions SET status='blocked',block_reason=?,reviewed_at=?
+                   WHERE tender_id=? AND status='pending' AND id<>?""",
+                ("修订复核时基准已切换为新版本，该修订基于过期版本，需按新生效基准重新提交", now, tender["id"], revision_id),
+            ).rowcount
+            conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (now, tender["id"]))
+            new_baseline = dict(conn.execute("SELECT * FROM scoring_baselines WHERE id=?", (new_baseline_id,)).fetchone())
+            new_baseline["criteria"] = criteria
+            self._audit(conn, tender["id"], actor, "baseline.revision_applied",
+                        {"revision_id": revision_id, "new_baseline_id": new_baseline_id,
+                         "old_baseline_id": baseline["id"], "blocked_revisions": blocked})
+            return {"baseline": new_baseline,
+                    "revision": dict(conn.execute("SELECT * FROM baseline_revisions WHERE id=?", (revision_id,)).fetchone()),
+                    "blocked_revisions": blocked}
+
+    def recover_pending_revisions(self) -> dict[str, Any]:
+        """服务重启后接着未完成修订：扫描待生效修订并在时间线登记恢复事件。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT br.id,br.tender_id,br.baseline_id,br.revision_no,br.proposed_by,br.proposed_at,
+                          sb.version AS baseline_version,sb.status AS baseline_status,
+                          t.status AS tender_status
+                   FROM baseline_revisions br
+                   JOIN scoring_baselines sb ON sb.id=br.baseline_id
+                   JOIN tenders t ON t.id=br.tender_id
+                   WHERE br.status='pending' ORDER BY br.id"""
+            ).fetchall()
+            recovered, stale = [], []
+            for row in rows:
+                if row["baseline_status"] != "active":
+                    conn.execute(
+                        "UPDATE baseline_revisions SET status='blocked',block_reason=? WHERE id=?",
+                        ("服务重启时发现所依据的基准已不再生效", row["id"]),
+                    )
+                    stale.append(row["id"])
+                else:
+                    recovered.append({"revision_id": row["id"], "tender_id": row["tender_id"],
+                                      "baseline_id": row["baseline_id"], "revision_no": row["revision_no"],
+                                      "proposed_by": row["proposed_by"], "proposed_at": row["proposed_at"],
+                                      "baseline_version": row["baseline_version"], "tender_status": row["tender_status"]})
+            if rows:
+                self._audit(conn, None, "system", "baseline.recovered",
+                            {"pending": [r["revision_id"] for r in recovered], "blocked": stale})
+            return {"pending_revisions": recovered, "blocked_on_recovery": stale}
+
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             tender = self._tender(conn, tender_id)
-            if tender["status"] not in {"opened", "reevaluation"}:
-                raise DomainError("当前项目不能授标", 409)
             if tender["version"] != int(expected_version):
                 raise DomainError("项目已变化，请刷新后重试", 409)
-            open_complaint = conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]
-            if open_complaint:
-                raise DomainError("存在未处理投诉，不能授标", 409)
-            bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
-            criteria = json.loads(tender["criteria"])
-            expected_criteria = {c["name"] for c in criteria}
-            ranking = []
-            for bid in bids:
-                rows = conn.execute(
-                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
-                    (bid["id"], tender["evaluation_round"]),
-                ).fetchall()
-                scores = {row["criterion"]: row["score"] for row in rows}
-                if set(scores) != expected_criteria:
-                    raise DomainError("投标尚未完成全部评分: %s" % bid["id"], 409)
-                weighted = 0.0
-                for criterion in criteria:
-                    weighted += scores[criterion["name"]] * criterion["weight"] / 100
-                ranking.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "price": bid["price"], "score": round(weighted, 2)})
-            if not ranking:
-                raise DomainError("没有可授标的有效投标", 409)
-            ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
+            blockers = self._award_blockers(conn, tender)
+            if blockers:
+                raise DomainError("暂不能授标：" + "；".join(b["reason"] for b in blockers), 409)
+            baseline = self._active_baseline(conn, tender_id)
+            ranking = self._ranking(conn, tender_id, tender["evaluation_round"], baseline)
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"],
+                        "baseline_id": baseline["id"], "baseline_no": baseline["baseline_no"],
+                        "criteria_hash": baseline["criteria_hash"],
+                        "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
-            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
+            self._audit(conn, tender_id, actor, "tender.awarded",
+                        {"winner": winner, "ranking": ranking, "baseline_id": baseline["id"]})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
+
+    def _award_blockers(self, conn: sqlite3.Connection, tender: sqlite3.Row) -> list[dict[str, Any]]:
+        """汇总授标阻断原因（详情页原样展示）。授标只接受生效基准。"""
+        blockers: list[dict[str, Any]] = []
+        if tender["status"] not in {"opened", "reevaluation"}:
+            blockers.append({"code": "status", "reason": "当前项目状态不能授标"})
+            return blockers
+        open_complaint = conn.execute(
+            "SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender["id"],)
+        ).fetchone()["c"]
+        if open_complaint:
+            blockers.append({"code": "open_complaint", "reason": "存在未处理投诉，不能授标"})
+        baseline = self._active_baseline(conn, tender["id"])
+        if not baseline:
+            blockers.append({"code": "no_baseline", "reason": "评分基准未经监督员确认，不能授标"})
+            return blockers
+        pending = conn.execute(
+            "SELECT id,reason,proposed_by FROM baseline_revisions WHERE tender_id=? AND status='pending' ORDER BY id",
+            (tender["id"],),
+        ).fetchall()
+        if pending:
+            blockers.append({
+                "code": "pending_revision",
+                "reason": "存在 %d 条待生效修订，须先复核（修订#%d，提案人 %s）"
+                          % (len(pending), pending[0]["id"], pending[0]["proposed_by"]),
+                "revision_ids": [row["id"] for row in pending],
+            })
+        criteria = json.loads(baseline["criteria"])
+        expected_criteria = {c["name"] for c in criteria}
+        bids = conn.execute(
+            "SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender["id"],)
+        ).fetchall()
+        incomplete, stale_round = [], []
+        stale_bids = {row["bid_id"] for row in conn.execute(
+            """SELECT DISTINCT e.bid_id FROM evaluations e
+               WHERE e.evaluation_round=? AND e.baseline_id<>?
+                 AND e.bid_id IN (SELECT id FROM bids WHERE tender_id=?)""",
+            (tender["evaluation_round"], baseline["id"], tender["id"]),
+        ).fetchall()}
+        for bid in bids:
+            rows = conn.execute(
+                """SELECT criterion FROM evaluations
+                   WHERE bid_id=? AND evaluation_round=? AND baseline_id=? GROUP BY criterion""",
+                (bid["id"], tender["evaluation_round"], baseline["id"]),
+            ).fetchall()
+            if {row["criterion"] for row in rows} == expected_criteria:
+                continue
+            # 新基准下评分不全：区分“从未按新基准评分”和“只留有旧基准评分”
+            if bid["id"] in stale_bids:
+                stale_round.append(bid["id"])
+            else:
+                incomplete.append(bid["id"])
+        if incomplete:
+            blockers.append({"code": "incomplete_evaluation",
+                             "reason": "存在未按生效基准完成评分的投标: %s" % ",".join(map(str, incomplete)),
+                             "bid_ids": incomplete})
+        if stale_round:
+            blockers.append({"code": "stale_baseline_scores",
+                             "reason": "生效基准已更新，下列投标仍只有旧基准评分，须按新基准重评: %s"
+                                       % ",".join(map(str, sorted(stale_round))),
+                             "bid_ids": sorted(stale_round),
+                             "active_baseline_id": baseline["id"]})
+        ranking = self._ranking(conn, tender["id"], tender["evaluation_round"], baseline)
+        if not ranking and not incomplete and not stale_round:
+            blockers.append({"code": "no_valid_bid", "reason": "没有可授标的有效投标"})
+        return blockers
+
+    def _baseline_view(self, conn: sqlite3.Connection, tender_id: int) -> dict[str, Any]:
+        """基准详情：全部基准快照 + 修订记录（含复核人和阻断原因）。"""
+        baseline_rows = conn.execute(
+            "SELECT * FROM scoring_baselines WHERE tender_id=? ORDER BY id", (tender_id,)
+        ).fetchall()
+        baselines = []
+        for row in baseline_rows:
+            item = dict(row)
+            item["criteria"] = json.loads(item["criteria"])
+            baselines.append(item)
+        revision_rows = conn.execute(
+            "SELECT * FROM baseline_revisions WHERE tender_id=? ORDER BY id", (tender_id,)
+        ).fetchall()
+        revisions = []
+        for row in revision_rows:
+            item = dict(row)
+            item["criteria"] = json.loads(item["criteria"])
+            revisions.append(item)
+        active = next((b for b in baselines if b["status"] == "active"), None)
+        return {"active": active, "history": baselines, "revisions": revisions}
+
+    def _scores_by_baseline(self, conn: sqlite3.Connection, tender_id: int) -> list[dict[str, Any]]:
+        """旧评分按当时基准回读：按 (投标, 轮次, 基准快照) 分组。"""
+        rows = conn.execute(
+            """SELECT e.bid_id,e.evaluation_round,e.baseline_id,e.evaluator,e.criterion,e.raw_value,e.score,
+                      sb.baseline_no,sb.status AS baseline_status
+               FROM evaluations e
+               JOIN bids b ON b.id=e.bid_id
+               JOIN scoring_baselines sb ON sb.id=e.baseline_id
+               WHERE b.tender_id=? ORDER BY e.bid_id,e.evaluation_round,sb.id,e.evaluator""",
+            (tender_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
+            privileged = role in {"procurement", "supervisor", "auditor"}
             bids = []
-            if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
+            if privileged and tender["status"] in {"opened", "reevaluation", "awarded"}:
                 bids = [dict(r) for r in conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()]
             elif role == "vendor":
                 bids = []
@@ -582,7 +947,21 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            payload: dict[str, Any] = {"tender": tender, "bids": bids, "clarifications": clarifications,
+                                       "baselines": self._baseline_view(conn, tender_id)}
+            if privileged and tender["status"] in {"opened", "reevaluation", "awarded"}:
+                # 授标前预检阻断原因；详情页向监督员/采购员/审计员展示
+                row = conn.execute("SELECT * FROM tenders WHERE id=?", (tender_id,)).fetchone()
+                payload["award_blockers"] = self._award_blockers(conn, row) \
+                    if tender["status"] in {"opened", "reevaluation"} else []
+                payload["scores_by_baseline"] = self._scores_by_baseline(conn, tender_id)
+                active = payload["baselines"]["active"]
+                if active:
+                    payload["current_ranking"] = self._ranking(
+                        conn, tender_id, tender["evaluation_round"],
+                        conn.execute("SELECT * FROM scoring_baselines WHERE id=?", (active["id"],)).fetchone(),
+                    )
+            return payload
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -716,6 +1095,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/baselines/confirm":
+                result = self.service.confirm_scoring_baseline(actor, role, **data)
+            elif path == "/api/baselines/revisions":
+                result = self.service.propose_baseline_revision(actor, role, **data)
+            elif path == "/api/baselines/revisions/review":
+                result = self.service.review_baseline_revision(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
@@ -732,8 +1117,11 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 def serve(service: ProcurementService, host: str, port: int) -> None:
     ApiHandler.service = service
+    recovery = service.recover_pending_revisions()
+    if recovery["pending_revisions"] or recovery["blocked_on_recovery"]:
+        print("Recovered pending baseline revisions: " + json.dumps(recovery, ensure_ascii=False), flush=True)
     server = ThreadingHTTPServer((host, port), ApiHandler)
-    print("Public procurement service listening on http://%s:%s" % (host, port))
+    print("Public procurement service listening on http://%s:%s" % (host, port), flush=True)
     server.serve_forever()
 
 

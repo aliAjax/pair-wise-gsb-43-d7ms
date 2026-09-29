@@ -39,6 +39,9 @@ class ProcurementFlowTest(unittest.TestCase):
         time.sleep(2.1)
         opened = self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
         self.assertEqual(2, len(opened["bids"]))
+        self.service.confirm_scoring_baseline(
+            "sup1", "supervisor", self.tender["id"], opened["tender"]["version"]
+        )
         self.service.evaluate_bid("eval1", "evaluator", opened["bids"][0]["id"], {"报价": 800000, "质量": 90})
         self.service.evaluate_bid("eval2", "evaluator", opened["bids"][0]["id"], {"报价": 800000, "质量": 90})
         self.service.evaluate_bid("eval1", "evaluator", opened["bids"][1]["id"], {"报价": 700000, "质量": 80})
@@ -51,7 +54,8 @@ class ProcurementFlowTest(unittest.TestCase):
     def test_conflict_and_duplicate_evaluation_are_rejected(self):
         bid = self.bid(self.vendor1, "vendor1", "B3", 800000, 90)
         time.sleep(2.1)
-        self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        opened = self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        self.service.confirm_scoring_baseline("sup1", "supervisor", self.tender["id"], opened["tender"]["version"])
         self.service.declare_conflict("eval1", "evaluator", self.tender["id"], "eval1", self.vendor1["id"], "曾受雇于供应商")
         with self.assertRaises(DomainError) as ctx:
             self.service.evaluate_bid("eval1", "evaluator", bid["id"], {"报价": 800000, "质量": 90})
@@ -64,7 +68,8 @@ class ProcurementFlowTest(unittest.TestCase):
     def test_complaint_reevaluation_award_block_and_permissions(self):
         bid = self.bid(self.vendor1, "vendor1", "B4", 800000, 90)
         time.sleep(2.1)
-        self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        opened = self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        self.service.confirm_scoring_baseline("sup1", "supervisor", self.tender["id"], opened["tender"]["version"])
         self.service.evaluate_bid("eval1", "evaluator", bid["id"], {"报价": 800000, "质量": 90})
         complaint = self.service.submit_complaint("vendor1", "vendor", self.tender["id"], "评分标准理解有误")
         current = self.service.get_tender("sup1", "supervisor", self.tender["id"])

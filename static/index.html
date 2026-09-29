@@ -1,6 +1,40 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}.block{background:#fdeeee;border-left:5px solid #c0392b;padding:10px 14px;margin:8px 0}.ok{background:#eef8f3;border-left:5px solid #23845b;padding:10px 14px;margin:8px 0}.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}.t-active{background:#23845b;color:#fff}.t-superseded{background:#95a5a6;color:#fff}.t-pending{background:#e67e22;color:#fff}.t-applied{background:#23845b;color:#fff}.t-rejected{background:#7f8c8d;color:#fff}.t-blocked{background:#c0392b;color:#fff}code{background:#edf0f2;padding:2px 5px}</style>
+<h1>公共采购密封投标与评审</h1><div class="card">评分基准经监督员确认后生成可恢复快照；开标后评分项、权重或分值调整只形成待生效修订，授标只接受生效基准。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th><th></th></tr></thead><tbody></tbody></table>
 <h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+
+<h2>项目详情（监督员视角）</h2>
+<div>查看项目：<input id="tid" placeholder="项目ID" size="6"> <button onclick="loadDetail()">加载</button> <span style="color:#667">需请求头 X-Role: supervisor</span></div>
+<div id="detail"></div>
+<script>
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function criteriaText(list){return list.map(c=>`${c.name} ${c.kind==='cost'?'价格分':'直接分'} 权重${c.weight} 上限${c.max_value}`).join('；')}
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td><td><a href="javascript:void(0)" onclick="show(${r.id})">详情</a></td></tr>`).join('');
+  document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${(r.payload_hash||'').slice(0,12)}…</td></tr>`).join('')
+}
+function show(id){document.querySelector('#tid').value=id;loadDetail()}
+async function loadDetail(){
+  const id=document.querySelector('#tid').value.trim();if(!id)return;
+  const d=await fetch('/api/tenders/'+id,{headers:{'X-Role':'supervisor','X-User':'sup-web'}}).then(r=>r.json());
+  if(d.error){document.querySelector('#detail').innerHTML=`<div class="block">${esc(d.error)}</div>`;return}
+  const b=d.baselines||{};const active=b.active;
+  const blockers=(d.award_blockers||[]);
+  let html=`<h3>评分基准</h3>`;
+  if(!active){html+=`<div class="block">尚无生效基准：评分与授标均被阻断，须由监督员确认。</div>`}
+  else{html+=`<div class="ok">生效基准 #${active.baseline_no}（ID ${active.id}，适用于第 ${active.applies_round} 轮，确认人 ${esc(active.confirmed_by)}，${esc(active.confirmed_at)}）<br>${esc(criteriaText(active.criteria))}<br><code>${esc(active.criteria_hash.slice(0,16))}…</code></div>`}
+  if(blockers.length){html+=`<h4>授标阻断原因</h4>`+blockers.map(x=>`<div class="block"><b>${esc(x.code)}</b>：${esc(x.reason)}</div>`).join('')}
+  else if(active){html+=`<div class="ok">当前无授标阻断。</div>`}
+  if((b.history||[]).length>1){html+=`<h4>基准快照历史（旧评分按当时基准回读）</h4><table><thead><tr><th>序号</th><th>状态</th><th>适用轮次</th><th>口径</th><th>确认人</th><th>时间</th></tr></thead><tbody>`
+    +b.history.map(x=>`<tr><td>${x.baseline_no}</td><td><span class="tag t-${x.status}">${x.status}</span></td><td>${x.applies_round}</td><td>${esc(criteriaText(x.criteria))}</td><td>${esc(x.confirmed_by)}</td><td>${esc(x.confirmed_at)}</td></tr>`).join('')+`</tbody></table>`}
+  const revs=b.revisions||[];
+  if(revs.length){html+=`<h4>修订记录</h4><table><thead><tr><th>#</th><th>状态</th><th>拟调整口径</th><th>原因</th><th>提案人</th><th>提案时间</th><th>复核人</th><th>复核时间/说明</th><th>阻断原因</th></tr></thead><tbody>`
+    +revs.map(x=>`<tr><td>${x.id}</td><td><span class="tag t-${x.status}">${x.status}</span></td><td>${esc(criteriaText(x.criteria))}</td><td>${esc(x.reason)}</td><td>${esc(x.proposed_by)}</td><td>${esc(x.proposed_at)}</td><td>${esc(x.reviewed_by||'')}</td><td>${esc(x.reviewed_at||'')} ${esc(x.review_note||'')}</td><td>${esc(x.block_reason||'')}</td></tr>`).join('')+`</tbody></table>`}
+  if(d.current_ranking){html+=`<h4>按生效基准回读的当前排名</h4><table><thead><tr><th>名次</th><th>投标</th><th>供应商</th><th>报价</th><th>得分</th><th>基准</th></tr></thead><tbody>`
+    +d.current_ranking.map((x,i)=>`<tr><td>${i+1}</td><td>${x.bid_id}</td><td>${x.vendor_id}</td><td>${x.price}</td><td>${x.score}</td><td>${x.baseline_id}</td></tr>`).join('')+`</tbody></table>`}
+  document.querySelector('#detail').innerHTML=html
+}
+load()
+</script></html>
